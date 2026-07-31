@@ -1,0 +1,8 @@
+{
+  "name": "island-draft-order-checkout-vercel",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {
+    "node": "22.x"
+  }
+}

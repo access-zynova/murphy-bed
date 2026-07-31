@@ -1,0 +1,15 @@
+ISLAND MURPHY BEDS VERCEL CHECKOUT — LOCAL TEST RESULTS
+
+- Zero third-party runtime dependencies
+- JavaScript syntax validation: PASS
+- GET configuration health response: PASS
+- Valid variant draft request: PASS
+- Variant priceOverride amount: PASS
+- Variant-not-found custom-line fallback: PASS
+- Missing-variant custom-line fallback: PASS
+- Invalid origin rejection: PASS
+- Invalid Shopify custom domain rejection: PASS
+- invoice_url response format: PASS
+- ZIP archive integrity: tested before delivery
+
+Live Shopify draft creation was not executed because live Shopify credentials were not used locally.
