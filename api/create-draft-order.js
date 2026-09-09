@@ -7,8 +7,36 @@ const FALLBACK_ALLOWED_ORIGINS = new Set([
   "https://hi70xm-dw.myshopify.com",
 ]);
 
+const CHECKOUT_PROFILES = Object.freeze({
+  island: Object.freeze({
+    name: "island",
+    rateBps: 1200,
+    currencyCode: "CAD",
+    fixedChargeLabel: "Sales Tax",
+  }),
+  murphy: Object.freeze({
+    name: "murphy",
+    rateBps: 1055,
+    currencyCode: "USD",
+    fixedChargeLabel: "Sales Tax",
+  }),
+});
+
+const DEPOSIT_PERCENTAGE = 50;
+
 let cachedAccessToken = null;
 let cachedAccessTokenExpiresAt = 0;
+
+function getCheckoutProfileName() {
+  return String(process.env.CHECKOUT_PROFILE || "")
+    .trim()
+    .toLowerCase();
+}
+
+function getCheckoutProfile() {
+  const profileName = getCheckoutProfileName();
+  return CHECKOUT_PROFILES[profileName] || null;
+}
 
 function getAllowedOrigins() {
   const csv = String(process.env.ALLOWED_ORIGINS_CSV || "").trim();
@@ -68,6 +96,19 @@ function dollarsToCents(value) {
   const numberValue = Number(value);
   if (!Number.isFinite(numberValue) || numberValue < 0) return 0;
   return Math.round(numberValue * 100);
+}
+
+function formatMoney(cents, currencyCode) {
+  return `${(cents / 100).toFixed(2)} ${currencyCode}`;
+}
+
+function formatRatePercent(rateBps) {
+  const percent = rateBps / 100;
+  return Number.isInteger(percent) ? String(percent) : String(percent.toFixed(2)).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function calculateBps(cents, rateBps) {
+  return Math.round((cents * rateBps) / 10000);
 }
 
 function stringifyPropertyValue(value) {
@@ -167,8 +208,6 @@ async function fetchClientCredentialsToken(storeDomain) {
 async function getShopifyAccessToken(storeDomain) {
   const staticToken = String(process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || "").trim();
 
-  // Prefer the static token when supplied, so unrelated old client credentials
-  // cannot silently override the intended Shopify store configuration.
   if (staticToken) {
     return { token: staticToken, authMode: "static_admin_token" };
   }
@@ -281,14 +320,21 @@ function createVariantLineItem({
   };
 }
 
-function createCustomLineItem({ title, quantity, totalCents, currencyCode, properties }) {
+function createCustomLineItem({
+  title,
+  quantity,
+  totalCents,
+  currencyCode,
+  properties,
+  requiresShipping = false,
+}) {
   const unitCents = Math.max(1, Math.round(totalCents / quantity));
 
   return {
     title,
     quantity,
-    requiresShipping: true,
-    taxable: true,
+    requiresShipping,
+    taxable: false,
     originalUnitPriceWithCurrency: moneyInput(unitCents, currencyCode),
     customAttributes: getCustomAttributes(properties),
   };
@@ -318,6 +364,7 @@ async function createDraft({ storeDomain, apiVersion, currencyCode, lineItems })
       input: {
         lineItems,
         presentmentCurrencyCode: currencyCode,
+        taxExempt: true,
       },
     },
   });
@@ -342,18 +389,76 @@ async function readJsonBody(req) {
   return raw ? JSON.parse(raw) : {};
 }
 
+function resolveFullOrderTotalCents(body) {
+  const explicitFullTotal = toNonNegativeInt(body.fullOrderTotalCents, 0);
+  if (explicitFullTotal > 0) return explicitFullTotal;
+
+  const suppliedDeposit = toNonNegativeInt(body.depositAmountCents, 0);
+  const suppliedRemaining = toNonNegativeInt(body.remainingBalanceCents, 0);
+  const suppliedDepositPercentage = toNonNegativeInt(body.depositPercentage, 0);
+  const paymentStage = String(body.paymentStage || "").trim().toLowerCase();
+
+  if (
+    suppliedDepositPercentage === DEPOSIT_PERCENTAGE &&
+    paymentStage === "deposit" &&
+    suppliedDeposit > 0
+  ) {
+    if (suppliedRemaining > 0) return suppliedDeposit + suppliedRemaining;
+    return suppliedDeposit * 2;
+  }
+
+  const basePriceCents = toNonNegativeInt(body.basePriceCents, 0);
+  const legacyPriceCents = dollarsToCents(body.price);
+  return toNonNegativeInt(body.finalTotalCents, legacyPriceCents || basePriceCents);
+}
+
+function validateOptionalDepositFields(body, expected) {
+  const errors = [];
+
+  if (body.depositPercentage !== undefined) {
+    const supplied = toNonNegativeInt(body.depositPercentage, -1);
+    if (supplied !== DEPOSIT_PERCENTAGE) {
+      errors.push(`depositPercentage must be ${DEPOSIT_PERCENTAGE}`);
+    }
+  }
+
+  if (body.depositAmountCents !== undefined) {
+    const supplied = toNonNegativeInt(body.depositAmountCents, -1);
+    if (supplied !== expected.depositAmountCents) {
+      errors.push("depositAmountCents does not match the server-calculated 50% deposit");
+    }
+  }
+
+  if (body.remainingBalanceCents !== undefined) {
+    const supplied = toNonNegativeInt(body.remainingBalanceCents, -1);
+    if (supplied !== expected.remainingBalanceCents) {
+      errors.push("remainingBalanceCents does not match the server-calculated remaining 50%");
+    }
+  }
+
+  return errors;
+}
+
 function configurationStatus() {
   const storeDomain = sanitizeStoreDomain(process.env.SHOPIFY_STORE_DOMAIN);
   const hasStaticToken = Boolean(String(process.env.SHOPIFY_ADMIN_ACCESS_TOKEN || "").trim());
   const hasClientCredentials = hasClientCredentialsConfigured();
   const storeDomainValid = Boolean(storeDomain && /\.myshopify\.com$/i.test(storeDomain));
   const authConfigured = hasStaticToken || hasClientCredentials;
+  const profile = getCheckoutProfile();
+  const profileConfigured = Boolean(profile);
 
   return {
-    ok: storeDomainValid && authConfigured,
-    service: "island-murphy-beds-draft-checkout",
+    ok: storeDomainValid && authConfigured && profileConfigured,
+    service: "murphy-island-fixed-rate-draft-checkout",
     api_version: String(process.env.SHOPIFY_API_VERSION || "2026-01").trim(),
-    currency: String(process.env.DEFAULT_CURRENCY_CODE || "CAD").trim().toUpperCase(),
+    checkout_profile: profile?.name || null,
+    currency: profile?.currencyCode || null,
+    deposit_percentage: DEPOSIT_PERCENTAGE,
+    fixed_charge_label: profile?.fixedChargeLabel || "Sales Tax",
+    fixed_rate_bps: profile?.rateBps || null,
+    fixed_rate_percent: profile ? `${formatRatePercent(profile.rateBps)}%` : null,
+    location_based_tax: false,
     store_domain_configured: Boolean(storeDomain),
     store_domain_valid: storeDomainValid,
     authentication_configured: authConfigured,
@@ -362,11 +467,12 @@ function configurationStatus() {
       : hasClientCredentials
         ? "client_credentials"
         : "missing",
+    checkout_profile_configured: profileConfigured,
     custom_line_fallback_enabled: process.env.ALLOW_CUSTOM_LINE_FALLBACK !== "false",
     message:
-      storeDomainValid && authConfigured
+      storeDomainValid && authConfigured && profileConfigured
         ? "Configuration is present. Run a Shopify storefront checkout test."
-        : "Add valid Shopify environment variables in Vercel and redeploy.",
+        : "Add valid Shopify credentials and CHECKOUT_PROFILE (island or murphy) in Vercel and redeploy.",
   };
 }
 
@@ -404,6 +510,15 @@ module.exports = async function handler(req, res) {
       });
     }
 
+    const profile = getCheckoutProfile();
+    if (!profile) {
+      return sendJson(req, res, 500, {
+        ok: false,
+        code: "INVALID_CHECKOUT_PROFILE",
+        errors: ["CHECKOUT_PROFILE must be set to island or murphy in Vercel"],
+      });
+    }
+
     let body;
     try {
       body = await readJsonBody(req);
@@ -423,35 +538,56 @@ module.exports = async function handler(req, res) {
         ? body.properties
         : {};
 
-    const currencyCode = String(
-      body.currencyCode || process.env.DEFAULT_CURRENCY_CODE || "CAD"
-    )
-      .trim()
-      .toUpperCase();
-
+    const currencyCode = profile.currencyCode;
     const basePriceCents = toNonNegativeInt(body.basePriceCents, 0);
-    const legacyPriceCents = dollarsToCents(body.price);
-    const finalTotalCents = toNonNegativeInt(
-      body.finalTotalCents,
-      legacyPriceCents || basePriceCents
+    const fullOrderTotalCents = resolveFullOrderTotalCents(body);
+    const depositAmountCents = Math.round(
+      (fullOrderTotalCents * DEPOSIT_PERCENTAGE) / 100
     );
+    const remainingBalanceCents = fullOrderTotalCents - depositAmountCents;
+    const salesTaxCents = calculateBps(depositAmountCents, profile.rateBps);
+    const checkoutTotalCents = depositAmountCents + salesTaxCents;
     const customizationPriceCents = toNonNegativeInt(
       body.customizationPriceCents,
-      Math.max(0, finalTotalCents - basePriceCents)
+      Math.max(0, fullOrderTotalCents - basePriceCents)
     );
 
-    const title = String(body.title || "Murphy Bed (Customizable)").trim() ||
+    const title =
+      String(body.title || "Murphy Bed (Customizable)").trim() ||
       "Murphy Bed (Customizable)";
 
     const allowCustomLineFallback =
       body.allowCustomLineFallback !== false &&
       process.env.ALLOW_CUSTOM_LINE_FALLBACK !== "false";
 
-    if (finalTotalCents <= 0) {
+    if (fullOrderTotalCents <= 0) {
       return sendJson(req, res, 400, {
         ok: false,
         code: "INVALID_TOTAL",
-        errors: ["finalTotalCents must be greater than zero"],
+        errors: [
+          "fullOrderTotalCents or finalTotalCents must represent a positive full order total",
+        ],
+      });
+    }
+
+    if (depositAmountCents <= 0) {
+      return sendJson(req, res, 400, {
+        ok: false,
+        code: "INVALID_DEPOSIT",
+        errors: ["The server-calculated 50% deposit must be greater than zero"],
+      });
+    }
+
+    const consistencyErrors = validateOptionalDepositFields(body, {
+      depositAmountCents,
+      remainingBalanceCents,
+    });
+
+    if (consistencyErrors.length > 0) {
+      return sendJson(req, res, 400, {
+        ok: false,
+        code: "DEPOSIT_MISMATCH",
+        errors: consistencyErrors,
       });
     }
 
@@ -476,7 +612,38 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    let checkoutMode = "variant_price_override";
+    const ratePercent = formatRatePercent(profile.rateBps);
+    const depositProperties = {
+      ...properties,
+      "Full Order Total": formatMoney(fullOrderTotalCents, currencyCode),
+      "Deposit Percentage": `${DEPOSIT_PERCENTAGE}%`,
+      "Deposit Amount": formatMoney(depositAmountCents, currencyCode),
+      "Remaining 50% After Installation": formatMoney(
+        remainingBalanceCents,
+        currencyCode
+      ),
+      "Checkout Profile": profile.name,
+      "Sales Tax Rate": `${ratePercent}%`,
+      "Sales Tax Amount": formatMoney(salesTaxCents, currencyCode),
+    };
+
+    const taxProperties = {
+      "Checkout Profile": profile.name,
+      "Sales Tax Rate": `${ratePercent}%`,
+      "Calculation Base": formatMoney(depositAmountCents, currencyCode),
+      "Sales Tax Amount": formatMoney(salesTaxCents, currencyCode),
+    };
+
+    const salesTaxLine = createCustomLineItem({
+      title: `${profile.fixedChargeLabel} (${ratePercent}%)`,
+      quantity: 1,
+      totalCents: salesTaxCents,
+      currencyCode,
+      properties: taxProperties,
+      requiresShipping: false,
+    });
+
+    let checkoutMode = "variant_50_percent_deposit_plus_sales_tax";
     let shopifyResponse;
 
     if (variantId) {
@@ -488,10 +655,11 @@ module.exports = async function handler(req, res) {
           createVariantLineItem({
             variantId,
             quantity,
-            totalCents: finalTotalCents,
+            totalCents: depositAmountCents,
             currencyCode,
-            properties,
+            properties: depositProperties,
           }),
+          salesTaxLine,
         ],
       });
 
@@ -502,36 +670,40 @@ module.exports = async function handler(req, res) {
         allowCustomLineFallback &&
         isVariantRelatedError(errors.messages)
       ) {
-        checkoutMode = "custom_line_variant_fallback";
+        checkoutMode = "custom_line_50_percent_deposit_variant_fallback_plus_sales_tax";
         shopifyResponse = await createDraft({
           storeDomain,
           apiVersion,
           currencyCode,
           lineItems: [
             createCustomLineItem({
-              title,
+              title: `${title} — 50% Deposit`,
               quantity,
-              totalCents: finalTotalCents,
+              totalCents: depositAmountCents,
               currencyCode,
-              properties,
+              properties: depositProperties,
+              requiresShipping: true,
             }),
+            salesTaxLine,
           ],
         });
       }
     } else if (allowCustomLineFallback) {
-      checkoutMode = "custom_line_missing_variant_fallback";
+      checkoutMode = "custom_line_50_percent_deposit_missing_variant_plus_sales_tax";
       shopifyResponse = await createDraft({
         storeDomain,
         apiVersion,
         currencyCode,
         lineItems: [
           createCustomLineItem({
-            title,
+            title: `${title} — 50% Deposit`,
             quantity,
-            totalCents: finalTotalCents,
+            totalCents: depositAmountCents,
             currencyCode,
-            properties,
+            properties: depositProperties,
+            requiresShipping: true,
           }),
+          salesTaxLine,
         ],
       });
     } else {
@@ -560,7 +732,9 @@ module.exports = async function handler(req, res) {
     if (userErrors.length > 0) {
       return sendJson(req, res, 400, {
         ok: false,
-        code: isVariantRelatedError(messages) ? "VARIANT_NOT_FOUND" : "DRAFT_ORDER_USER_ERROR",
+        code: isVariantRelatedError(messages)
+          ? "VARIANT_NOT_FOUND"
+          : "DRAFT_ORDER_USER_ERROR",
         errors: messages,
         fields: userErrors.map((error) => error?.field || []),
         configured_store: storeDomain,
@@ -586,10 +760,19 @@ module.exports = async function handler(req, res) {
       ok: true,
       invoice_url: invoiceUrl,
       checkout_mode: checkoutMode,
+      checkout_profile: profile.name,
       variant_id: normalizeVariantNumericId(variantIdRaw) || null,
+      currency_code: currencyCode,
       base_price_cents: basePriceCents,
       customization_price_cents: customizationPriceCents,
-      final_total_cents: finalTotalCents,
+      full_order_total_cents: fullOrderTotalCents,
+      deposit_percentage: DEPOSIT_PERCENTAGE,
+      deposit_amount_cents: depositAmountCents,
+      remaining_balance_cents: remainingBalanceCents,
+      sales_tax_rate_bps: profile.rateBps,
+      sales_tax_rate_percent: `${ratePercent}%`,
+      sales_tax_cents: salesTaxCents,
+      checkout_total_cents: checkoutTotalCents,
       configured_store: storeDomain,
       auth_mode: shopifyResponse.authMode,
     });
