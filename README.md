@@ -36,6 +36,9 @@ When both are configured, the static Admin API token is used first.
 
 ## Builder URL
 
+
+Deployment trigger: Murphy production checkout update
+
 The Shopify JavaScript must call the deployed production endpoint:
 
 ```js
